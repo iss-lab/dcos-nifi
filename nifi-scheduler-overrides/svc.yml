@@ -1,0 +1,237 @@
+name: {{FRAMEWORK_NAME}}
+scheduler:
+  principal: {{FRAMEWORK_PRINCIPAL}}
+  zookeeper: {{FRAMEWORK_ZOOKEEPER}}
+  user: {{FRAMEWORK_USER}}
+pods:
+  nifi:
+    count: {{NODE_COUNT}}
+    image: {{BASE_NIFI_IMAGE}}
+    placement: '{{{NODE_PLACEMENT_CONSTRAINTS}}}'
+    {{#ENABLE_VIRTUAL_NETWORK}}
+    networks:
+      {{VIRTUAL_NETWORK_NAME}}:
+        labels: {{VIRTUAL_NETWORK_PLUGIN_LABELS}}
+    {{/ENABLE_VIRTUAL_NETWORK}}
+    volume:
+      path: {{NODE_MISC_REPOSITORY_DISK_PATH}}
+      type: {{NODE_MISC_REPOSITORY_DISK_TYPE}}
+      size: {{NODE_MISC_REPOSITORY_DISK_SIZE}}
+    rlimits:
+      RLIMIT_NOFILE:
+        soft: {{NODE_RLIMIT_NOFILE_SOFT}}
+        hard: {{NODE_RLIMIT_NOFILE_HARD}}
+      RLIMIT_NPROC:
+        soft: {{NODE_RLIMIT_NPROC_SOFT}}
+        hard: {{NODE_RLIMIT_NPROC_HARD}}
+    resource-sets:
+      node-resources:
+        cpus: {{NODE_CPUS}}
+        memory: {{NODE_MEM}}
+        volumes:
+          database-repository:
+            path: {{NODE_DATABASE_REPOSITORY_DISK_PATH}}
+            type: {{NODE_DATABASE_REPOSITORY_DISK_TYPE}}
+            size: {{NODE_DATABASE_REPOSITORY_DISK_SIZE}}
+          flowfile-repository:
+            path: {{NODE_FLOWFILE_REPOSITORY_DISK_PATH}}
+            type: {{NODE_FLOWFILE_REPOSITORY_DISK_TYPE}}
+            size: {{NODE_FLOWFILE_REPOSITORY_DISK_SIZE}}
+          provenance-repository:
+            path: {{NODE_PROVENANCE_REPOSITORY_DISK_PATH}}
+            type: {{NODE_PROVENANCE_REPOSITORY_DISK_TYPE}}
+            size: {{NODE_PROVENANCE_REPOSITORY_DISK_SIZE}}
+          content-repository:
+            path: {{NODE_CONTENT_REPOSITORY_DISK_PATH}}
+            type: {{NODE_CONTENT_REPOSITORY_DISK_TYPE}}
+            size: {{NODE_CONTENT_REPOSITORY_DISK_SIZE}}
+        ports:
+          node:
+            port: 0
+            env-key: PORT_WEB
+            advertise: true
+            vip:
+              prefix: node
+              port: 8080
+      sidecar-resources:
+        cpus: 0.5
+        memory: 512
+        volume:
+          path: nifi-backup
+          type: {{BACKUP_DISK_TYPE}}
+          size: {{BACKUP_DISK_SIZE}}
+      sidecar-cleanupresources:
+        cpus: 0.5
+        memory: 512
+    uris:
+      - {{JAVA_URI}}
+      - {{BOOTSTRAP_URI}}
+      - {{NIFI_URI}}
+      - {{NIFI_TOOLKIT_URI}}
+      - {{NIFI_JANITOR_JAR_URI}}
+      - {{NIFI_STATSD_JAR_URI}}
+      - {{NIFI_API_ACCESS_JAR_URI}}
+      - {{NIFI_PYHTON_URI}}
+
+    {{#TASKCFG_ALL_SECRETS_ENABLED}}
+    secrets:
+    {{#TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+      keytab:
+        secret: {{SECURITY_KERBEROS_KEYTAB_SECRET}}
+        file: node.keytab
+      usersecret:
+        secret: {{SECURITY_NIFI_KERBEROS_USER_PRINCIPAL_KEYTAB}}
+        env-key: KERBEROS_SECRET
+        file: usernode.keytab
+    {{/TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+
+    {{#TASKCFG_ALL_SECRETS_SECRET_ENABLED}}
+      secret1:
+        secret: {{FRAMEWORK_NAME}}/config-secret
+        file: config-secret.sh
+    {{/TASKCFG_ALL_SECRETS_SECRET_ENABLED}}
+    {{/TASKCFG_ALL_SECRETS_ENABLED}}
+
+    tasks:
+      metrics:
+        goal: RUNNING
+        essential: false
+        cmd: |
+            export JAVA_HOME=$(ls -d $MESOS_SANDBOX/jdk*/)
+            usernodesecret=`cat usernode.keytab`
+            echo "Before running statsd"
+            cp misc-repository/url-info.properties .
+            $JAVA_HOME/bin/java -jar nifi-statsd.jar url-info.properties $STATSD_UDP_HOST $STATSD_UDP_PORT ${NIFI_METRICS_FREQUENCY} ${SECURITY_KERBEROS_ENABLED} ${NIFI_KERBEROS_USER_PRINCIPAL} "$usernodesecret"
+            echo "After running statsd"
+        cpus: 0.2
+        memory: 32
+      node:
+        resource-set: node-resources
+        goal: RUNNING
+        cmd: |
+            export JAVA_HOME=$(ls -d $MESOS_SANDBOX/jdk*/)
+            ./bootstrap
+            touch create-secret.sh
+            cat config-secret.sh > create-secret.sh
+            chmod +x create-secret.sh
+            ./create-secret.sh
+            if [ ! -z "$NIFI_CORE_ADDITIONAL_NAR_LIBRARY" ]; then
+              NIFI_CORE_ADDITIONAL_NAR_LIBRARY=$(echo $NIFI_CORE_ADDITIONAL_NAR_LIBRARY | sed "s/,/ /g")
+              wget -P $MESOS_SANDBOX/nifi-{{NIFI_VERSION}}/nars/lib1 $NIFI_CORE_ADDITIONAL_NAR_LIBRARY
+            fi
+
+            init_status=`cat misc-repository/init-status.txt`
+            echo $init_status
+            if [ "$init_status" = "Y" ] ; then
+              mv misc-repository/login-identity-providers.xml nifi-{{NIFI_VERSION}}/conf
+              mv misc-repository/authorizers.xml nifi-{{NIFI_VERSION}}/conf
+              echo "N" > misc-repository/init-status.txt
+            fi
+            ./nifi-${NIFI_VERSION}/bin/nifi.sh run
+        configs:
+          nifi.properties:
+            template: nifi.properties.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/nifi.properties
+          authorizer-conf:
+            template: authorizers.xml.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/authorizers.xml
+          bootstrap.conf:
+            template: bootstrap.conf.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/bootstrap.conf
+          statemanagement.conf:
+            template: state.management.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/state-management.xml
+        {{#TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+          krb-login-provider-conf:
+            template: login-identity-providers.xml.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/login-identity-providers.xml
+          krb5-conf:
+            template: krb5.conf.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/krb5.conf
+          krb-blank-authorizer-conf:
+            template: blank.authorizers.xml.mustache
+            dest: nifi-{{NIFI_VERSION}}/conf/authorizers.xml
+        {{/TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+        readiness-check:
+            cmd: "curl -k -I -s -f -L http://$TASK_NAME.$FRAMEWORK_HOST:$PORT_WEB/nifi"
+            interval: 5
+            delay: 0
+            timeout: 10
+        env:
+          NODE_CPUS: {{NODE_CPUS}}
+          NODE_MEM: {{NODE_MEM}}
+          NIFI_VERSION: {{NIFI_VERSION}}
+        {{#TASKCFG_ALL_NIFI_CLUSTER_PROTOCOL_IS_SECURE}}
+        transport-encryption:
+          - name: node
+            type: KEYSTORE
+        {{/TASKCFG_ALL_NIFI_CLUSTER_PROTOCOL_IS_SECURE}}
+        kill-grace-period: {{TASKCFG_ALL_NIFI_KILL_GRACE_PERIOD}}
+      nifi-access:
+        goal: ONCE
+        cmd: |
+         # Provide access to initial admin to Nifi System Diagnostics.
+         misc_repo_path=misc-repository
+         sleep 180
+         cp $misc_repo_path/readiness-info.txt .
+         cp $misc_repo_path/url-info.properties .
+         usernodesecret=`cat usernode.keytab`
+         echo "Executing NiFi API Access."
+         export JAVA_HOME=$(ls -d $MESOS_SANDBOX/jdk*/)
+         $JAVA_HOME/bin/java -jar nifi-api-access.jar readiness-info.txt url-info.properties ${NIFI_KERBEROS_USER_PRINCIPAL} "$usernodesecret"
+        resource-set: sidecar-cleanupresources
+      backup:
+        goal: ONCE
+        cmd: |
+          export JAVA_HOME=$(ls -d $MESOS_SANDBOX/jdk*/)
+          ./nifi-toolkit-${NIFI_VERSION}/bin/file-manager.sh -o backup -b nifi-backup -c $MESOS_SANDBOX/nifi-${NIFI_VERSION} -v;
+        resource-set: sidecar-resources
+      upload-s3:
+        goal: ONCE
+        cmd: |
+          aws s3 cp nifi-backup s3://${S3_BUCKET_NAME}/nifi-${POD_INSTANCE_INDEX}/ --recursive
+        resource-set: sidecar-resources
+      cleanup-backup:
+        goal: ONCE
+        cmd: |
+          export JAVA_HOME=$(ls -d $MESOS_SANDBOX/jdk*/)
+          rm -r nifi-backup/*
+        resource-set: sidecar-resources
+plans:
+  deploy:
+    strategy: serial
+    phases:
+      node:
+        strategy: serial
+        pod: nifi
+        steps:
+       {{#TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+          - 0: [[node], [nifi-access], [metrics]]
+       {{/TASKCFG_ALL_SECURITY_KERBEROS_ENABLED}}
+          - default: [[node], [metrics]]
+  replace:
+    strategy: serial
+    phases:
+      node:
+        strategy: serial
+        pod: nifi
+        steps:
+          - default: [[node], [metrics]]
+  backup-s3:
+    strategy: serial
+    phases:
+      backup:
+        strategy: serial
+        pod: nifi
+        steps:
+          - default: [[backup]]
+      upload-backups:
+        strategy: serial
+        pod: nifi
+        steps:
+          - default: [[upload-s3]]
+      cleanup-backups:
+        strategy: serial
+        pod: nifi
+        steps:
+          - default: [[cleanup-backup]]
